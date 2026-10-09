@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RR Changelog</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="page">
+  <header class="top">
+    <h1>RR Changelog</h1>
+    <p class="sub">Last-updated dates for every chapter of the RoyalRoad fictions you track.</p>
+  </header>
+
+  <form id="add-form" class="add">
+    <input id="add-url" type="text" placeholder="Paste a RoyalRoad fiction or chapter URL" aria-label="RoyalRoad URL" required>
+    <button type="submit">Add fiction</button>
+  </form>
+  <p id="add-error" class="error" hidden></p>
+
+  <div class="toolbar">
+    <h2>Library</h2>
+    <button id="refresh-all" class="secondary" type="button">Refresh all</button>
+  </div>
+  <ul id="library" class="library"></ul>
+  <p id="empty" class="empty" hidden>No fictions yet. Paste a URL above to start tracking one.</p>
+</div>
+
+<script src="/app.js"></script>
+<script>
+"use strict";
+const { api, h, dateEl, progressEl, runSummaryEl } = RR;
+let pollTimer = null;
+
+function card(f) {
+  const busy = Boolean(f.active_run);
+  const synced = Boolean(f.last_synced_at);
+  const failed = f.last_run && ["failed", "interrupted"].includes(f.last_run.status) && !busy;
+
+  const meta = synced
+    ? [`${f.chapter_count} chapters · ${f.edited_count} edited · latest update `, dateEl(f.latest_update_at)]
+    : [busy ? "First sync in progress…" : "Not synced yet"];
+
+  const status = busy
+    ? progressEl(f.active_run)
+    : [
+        synced ? h("span", { class: "muted small" }, "Synced ", dateEl(f.last_synced_at, { relativeText: true })) : null,
+        synced && f.last_completed_run_is_baseline ? h("span", { class: "muted small" }, "· first sync") : null,
+        synced && !f.last_completed_run_is_baseline ? runSummaryEl(f.last_completed_run) : null,
+        failed ? h("span", { class: "error small" }, `Last sync ${f.last_run.status}: ${f.last_run.error || "unknown error"}`) : null,
+      ];
+
+  return h("li", { class: "card" },
+    f.cover_url ? h("img", { class: "cover", src: f.cover_url, alt: "", loading: "lazy", referrerpolicy: "no-referrer" })
+                : h("div", { class: "cover" }),
+    h("div", {},
+      h("a", { class: "title", href: `/fiction.html?id=${f.id}` }, f.title),
+      f.author ? h("span", { class: "muted" }, ` by ${f.author}`) : null,
+      h("div", { class: "meta muted small" }, meta),
+      h("div", { class: "status" }, status)),
+    h("div", { class: "actions" },
+      h("button", { class: "secondary", type: "button", disabled: busy, onclick: () => refresh(f.id) },
+        busy ? "Syncing…" : "Refresh"),
+      h("button", { class: "danger", type: "button", disabled: busy, onclick: () => remove(f) }, "Remove")));
+}
+
+async function load() {
+  let fictions;
+  try {
+    fictions = await api("/api/fictions");
+  } catch (e) {
+    showError(`Couldn't load the library: ${e.message}`);
+    return;
+  }
+  document.getElementById("library").replaceChildren(...fictions.map(card));
+  document.getElementById("empty").hidden = fictions.length > 0;
+  document.getElementById("refresh-all").disabled = fictions.length === 0;
+  clearTimeout(pollTimer);
+  if (fictions.some(f => f.active_run)) pollTimer = setTimeout(load, 1500);
+}
+
+function showError(message) {
+  const el = document.getElementById("add-error");
+  el.textContent = message || "";
+  el.hidden = !message;
+}
+
+async function refresh(id) {
+  try { await api(`/api/fictions/${id}/refresh`, { method: "POST" }); }
+  catch (e) { if (e.status !== 409) showError(e.message); }
+  load();
+}
+
+async function remove(f) {
+  if (!confirm(`Remove “${f.title}” and its history from your library?`)) return;
+  await api(`/api/fictions/${f.id}`, { method: "DELETE" });
+  load();
+}
+
+document.getElementById("add-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = document.getElementById("add-url");
+  showError("");
+  try {
+    await api("/api/fictions", { method: "POST", body: { url: input.value } });
+    input.value = "";
+  } catch (e) {
+    showError(e.message);
+  }
+  load();
+});
+
+document.getElementById("refresh-all").addEventListener("click", async () => {
+  await api("/api/refresh-all", { method: "POST" });
+  load();
+});
+
+load();
+</script>
+</body>
+</html>

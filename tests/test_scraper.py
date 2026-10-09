@@ -1,4 +1,4 @@
-"""Tests for rr_poc.py.
+"""Tests for rrchangelog/scraper.py and the poc/scraper.py CLI.
 
 The HTML below is hand-written. CHAPTER_PAGE and REDESIGN_CHAPTER_PAGE mirror live markup;
 the fiction pages mirror structures documented by FanFicFare's RoyalRoad adapter
@@ -14,7 +14,12 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 
-import rr_poc
+import sys
+
+from rrchangelog import scraper
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "poc"))
+import rr_poc  # noqa: E402  (the PoC CLI)
 
 REDESIGN_FICTION = """<!DOCTYPE html><html><head><title>Test Story | Royal Road</title>
 <script type="application/ld+json">{"@type":"Book","name":"Test Story",
@@ -77,18 +82,18 @@ CHALLENGE_PAGE = """<!DOCTYPE html><html lang="en-US"><head><title>Just a moment
 
 class ParseFictionIdTests(unittest.TestCase):
     def test_accepts_fiction_chapter_and_bare_ids(self):
-        self.assertEqual(rr_poc.parse_fiction_id("https://www.royalroad.com/fiction/21220/mother-of-learning"), 21220)
-        self.assertEqual(rr_poc.parse_fiction_id("royalroad.com/fiction/21220/x/chapter/301778/1-good-morning"), 21220)
-        self.assertEqual(rr_poc.parse_fiction_id(" 21220 "), 21220)
+        self.assertEqual(scraper.parse_fiction_id("https://www.royalroad.com/fiction/21220/mother-of-learning"), 21220)
+        self.assertEqual(scraper.parse_fiction_id("royalroad.com/fiction/21220/x/chapter/301778/1-good-morning"), 21220)
+        self.assertEqual(scraper.parse_fiction_id(" 21220 "), 21220)
 
     def test_rejects_other_urls(self):
         with self.assertRaises(ValueError):
-            rr_poc.parse_fiction_id("https://example.com/fiction/1")
+            scraper.parse_fiction_id("https://example.com/fiction/1")
 
 
 class ParseFictionTests(unittest.TestCase):
     def test_redesign_window_chapters_and_json_ld(self):
-        f = rr_poc.parse_fiction(REDESIGN_FICTION, 41656)
+        f = scraper.parse_fiction(REDESIGN_FICTION, 41656)
         self.assertEqual((f.title, f.author), ("Test Story", "Some Author"))
         self.assertEqual(f.date_modified, datetime(2026, 10, 1, 12, tzinfo=timezone.utc))
         self.assertEqual([c.id for c in f.chapters], [654078, 654100, 654200])
@@ -98,25 +103,25 @@ class ParseFictionTests(unittest.TestCase):
         self.assertEqual([c.locked for c in f.chapters], [False, False, True])
 
     def test_legacy_table_fallback(self):
-        f = rr_poc.parse_fiction(LEGACY_FICTION, 100)
+        f = scraper.parse_fiction(LEGACY_FICTION, 100)
         self.assertEqual((f.title, f.author), ("Old Story", "Legacy Author"))
         self.assertEqual([(c.id, c.title) for c in f.chapters], [(1001, "Chapter One"), (1002, "Chapter Two")])
         self.assertEqual(f.chapters[0].published, datetime.fromtimestamp(1600000000, tz=timezone.utc))
 
     def test_no_chapters_raises(self):
         with self.assertRaises(ValueError):
-            rr_poc.parse_fiction("<html><body>nothing</body></html>", 1)
+            scraper.parse_fiction("<html><body>nothing</body></html>", 1)
 
 
 class ParseChapterDatesTests(unittest.TestCase):
     def test_classifies_labelled_time_elements(self):
-        d = rr_poc.parse_chapter_dates(CHAPTER_PAGE)
+        d = scraper.parse_chapter_dates(CHAPTER_PAGE)
         self.assertEqual(d.published.value, datetime(2021, 3, 28, 16, 13, 23, tzinfo=timezone.utc))
         self.assertEqual(d.updated.value, datetime(2022, 1, 5, 8, 30, tzinfo=timezone.utc))
         self.assertIn("Last Edit", d.updated.source)
 
     def test_redesign_icons_and_trailing_tooltips(self):
-        d = rr_poc.parse_chapter_dates(REDESIGN_CHAPTER_PAGE)
+        d = scraper.parse_chapter_dates(REDESIGN_CHAPTER_PAGE)
         self.assertEqual(d.published.value, datetime(2025, 11, 26, 15, 13, 47, tzinfo=timezone.utc))
         self.assertEqual(d.updated.value, datetime(2026, 7, 28, 14, 16, 32, tzinfo=timezone.utc))
         self.assertIn("Edited At", d.updated.source)
@@ -125,7 +130,7 @@ class ParseChapterDatesTests(unittest.TestCase):
     def test_redesign_unedited_chapter_has_no_updated_date(self):
         start = REDESIGN_CHAPTER_PAGE.index('<div data-rr-tooltip class="relative inline-flex justify-center"><div data-rr-tooltip-trigger class="cursor-default"><i class="fa fa-edit')
         end = REDESIGN_CHAPTER_PAGE.index("</span>", start)
-        d = rr_poc.parse_chapter_dates(REDESIGN_CHAPTER_PAGE[:start] + REDESIGN_CHAPTER_PAGE[end:])
+        d = scraper.parse_chapter_dates(REDESIGN_CHAPTER_PAGE[:start] + REDESIGN_CHAPTER_PAGE[end:])
         self.assertIsNotNone(d.published)
         self.assertIsNone(d.updated)
 
@@ -133,28 +138,28 @@ class ParseChapterDatesTests(unittest.TestCase):
         page = """<html><head><meta property="article:modified_time" content="2023-02-02T00:00:00Z">
         <script type="application/ld+json">{"@type":"Article","datePublished":"2023-01-01T00:00:00Z"}</script>
         </head><body></body></html>"""
-        d = rr_poc.parse_chapter_dates(page)
+        d = scraper.parse_chapter_dates(page)
         self.assertEqual(d.updated.source, "meta article:modified_time")
         self.assertEqual(d.published.source, "json-ld Article.datePublished")
 
     def test_no_dates(self):
-        d = rr_poc.parse_chapter_dates("<html><body><p>hi</p></body></html>")
+        d = scraper.parse_chapter_dates("<html><body><p>hi</p></body></html>")
         self.assertIsNone(d.updated)
         self.assertEqual(d.candidates, [])
 
 
     def test_unedited_chapter_has_no_updated_date(self):
         page = CHAPTER_PAGE.split("<li>\n            <i class=\"fa fa-edit\"")[0] + "</ul></div></body></html>"
-        d = rr_poc.parse_chapter_dates(page)
+        d = scraper.parse_chapter_dates(page)
         self.assertIsNotNone(d.published)
         self.assertIsNone(d.updated)
 
 
 class CloudflareTests(unittest.TestCase):
     def test_detects_interstitial_only(self):
-        self.assertTrue(rr_poc.is_cloudflare_challenge(CHALLENGE_PAGE))
+        self.assertTrue(scraper.is_cloudflare_challenge(CHALLENGE_PAGE))
         normal = REDESIGN_FICTION.replace("</body>", '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script></body>')
-        self.assertFalse(rr_poc.is_cloudflare_challenge(normal))
+        self.assertFalse(scraper.is_cloudflare_challenge(normal))
 
 
 class FetcherFallbackTests(unittest.TestCase):
@@ -163,7 +168,7 @@ class FetcherFallbackTests(unittest.TestCase):
 
         def blocked_fetch(url, user_agent, cookie):
             self.http_calls.append(url)
-            raise rr_poc.CloudflareBlocked(url)
+            raise scraper.CloudflareBlocked(url)
 
         test = self
 
@@ -178,16 +183,14 @@ class FetcherFallbackTests(unittest.TestCase):
             def close(self):
                 pass
 
-        self._orig = rr_poc.fetch, rr_poc.BrowserFetcher
-        rr_poc.fetch, rr_poc.BrowserFetcher = blocked_fetch, FakeBrowser
+        self._orig = scraper.fetch, scraper.BrowserFetcher
+        scraper.fetch, scraper.BrowserFetcher = blocked_fetch, FakeBrowser
 
     def tearDown(self):
-        rr_poc.fetch, rr_poc.BrowserFetcher = self._orig
+        scraper.fetch, scraper.BrowserFetcher = self._orig
 
     def source(self, fetcher):
-        args = rr_poc.argparse.Namespace(fetcher=fetcher, from_dir=None, save_html=None, delay=0,
-                                         user_agent="ua", cookie=None, show_browser=False, browser_profile="unused")
-        return rr_poc.PageSource(args)
+        return scraper.PageSource(fetcher=fetcher, delay=0, user_agent="ua", browser_profile=Path("unused"))
 
     def test_auto_switches_to_browser_once_and_stays(self):
         src = self.source("auto")
@@ -198,7 +201,7 @@ class FetcherFallbackTests(unittest.TestCase):
         self.assertEqual(self.browser_calls, ["u1", "u2"])
 
     def test_http_mode_never_uses_browser(self):
-        with self.assertRaises(rr_poc.CloudflareBlocked):
+        with self.assertRaises(scraper.CloudflareBlocked):
             self.source("http").get("a", "u1")
         self.assertEqual(self.browser_calls, [])
 

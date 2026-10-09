@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fiction · RR Changelog</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="page">
+  <a class="back" href="/">← Library</a>
+  <p id="load-error" class="error" hidden></p>
+
+  <header id="head" class="fiction-head"></header>
+
+  <div class="controls">
+    <input id="search" type="search" placeholder="Filter chapters by title" aria-label="Filter chapters by title">
+    <label><input id="only-edited" type="checkbox"> Edited only</label>
+    <label><input id="show-removed" type="checkbox"> Show removed</label>
+    <span class="muted small">Highlighted rows changed in the last sync.</span>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th data-sort="position" aria-sort="ascending"><button type="button">#</button></th>
+          <th data-sort="title"><button type="button">Chapter</button></th>
+          <th data-sort="published_at"><button type="button">Published</button></th>
+          <th data-sort="edited_at"><button type="button">Last edited</button></th>
+          <th data-sort="last_checked_at"><button type="button">Checked</button></th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <p id="no-rows" class="empty" hidden></p>
+
+  <section class="changelog">
+    <h2>Changelog</h2>
+    <ol id="changes"></ol>
+    <p id="no-changes" class="muted small" hidden>No changes recorded yet. The first sync sets the baseline; later refreshes list what changed.</p>
+  </section>
+</div>
+
+<script src="/app.js"></script>
+<script>
+"use strict";
+const { api, h, dateEl, duration, progressEl, runSummaryEl } = RR;
+const fictionId = new URLSearchParams(location.search).get("id");
+const state = { fiction: null, sort: { key: "position", dir: 1 } };
+let pollTimer = null;
+
+const CHANGE_LABELS = { new: "new", edited: "edited", removed: "removed", restored: "restored",
+                        retitled: "retitled", unlocked: "unlocked" };
+
+function header(f) {
+  const busy = Boolean(f.active_run);
+  const failed = f.last_run && ["failed", "interrupted"].includes(f.last_run.status) && !busy;
+  return [
+    f.cover_url ? h("img", { class: "cover", src: f.cover_url, alt: "", referrerpolicy: "no-referrer" }) : h("div", { class: "cover" }),
+    h("div", {},
+      h("h1", {}, f.title),
+      h("div", { class: "muted" }, f.author ? `by ${f.author} · ` : "", h("a", { href: f.url, target: "_blank", rel: "noopener" }, "View on RoyalRoad")),
+      f.last_synced_at ? h("div", { class: "stats small" },
+        h("span", {}, h("strong", {}, f.chapter_count), " chapters"),
+        h("span", {}, h("strong", {}, f.edited_count), " edited"),
+        h("span", {}, "Latest update ", dateEl(f.latest_update_at)),
+        h("span", { class: "muted" }, "Synced ", dateEl(f.last_synced_at, { relativeText: true }))) : null,
+      h("div", { class: "status" },
+        busy ? progressEl(f.active_run) : null,
+        !busy && f.last_completed_run && !f.last_completed_run_is_baseline ? ["Last sync: ", runSummaryEl(f.last_completed_run)] : null,
+        failed ? h("span", { class: "error small" }, `Last sync ${f.last_run.status}: ${f.last_run.error || "unknown error"}`) : null)),
+    h("div", { class: "head-actions" },
+      h("button", { type: "button", disabled: busy, onclick: refresh }, busy ? "Syncing…" : "Refresh")),
+  ];
+}
+
+function compare(a, b) {
+  const { key, dir } = state.sort;
+  const va = key === "edited_at" ? a.edited_at : a[key];
+  const vb = key === "edited_at" ? b.edited_at : b[key];
+  // Never-edited / unknown values sort last in either direction.
+  if (va == null && vb == null) return a.position - b.position;
+  if (va == null) return 1;
+  if (vb == null) return -1;
+  const cmp = typeof va === "number" ? va - vb : String(va).localeCompare(String(vb), undefined, { numeric: true });
+  return cmp * dir || a.position - b.position;
+}
+
+function row(ch) {
+  const badges = ch.recent_changes.map(c => h("span", { class: `badge ${c}` }, CHANGE_LABELS[c] || c));
+  if (ch.status === "locked") badges.push(h("span", { class: "badge locked" }, "premium"));
+  if (ch.status === "removed") badges.push(h("span", { class: "badge removed" }, "removed"));
+  if (ch.check_error) badges.push(h("span", { class: "badge error", title: ch.check_error }, "check failed"));
+
+  const edited = ch.edited_at
+    ? [dateEl(ch.edited_at), ch.published_at ? h("span", { class: "gap" }, `${duration(ch.published_at, ch.edited_at)} after`) : null]
+    : h("span", { class: "muted", title: ch.status === "active" && ch.last_checked_at ? "RoyalRoad shows no edit date for this chapter" : "" },
+        ch.status === "active" && ch.last_checked_at ? "never" : "—");
+
+  return h("tr", { class: [ch.recent_changes.length ? "recent" : "", ch.status === "removed" ? "removed" : ""].join(" ").trim() || null },
+    h("td", { class: "num" }, ch.position + 1),
+    h("td", {}, h("div", { class: "chapter-title" }, h("a", { href: ch.url, target: "_blank", rel: "noopener" }, ch.title), badges)),
+    h("td", { class: "date" }, dateEl(ch.published_at) || h("span", { class: "muted" }, "—")),
+    h("td", { class: "date" }, edited),
+    h("td", { class: "date muted small" }, dateEl(ch.last_checked_at, { relativeText: true }) || "—"));
+}
+
+function renderTable() {
+  const f = state.fiction;
+  const q = document.getElementById("search").value.trim().toLowerCase();
+  const onlyEdited = document.getElementById("only-edited").checked;
+  const showRemoved = document.getElementById("show-removed").checked;
+  const chapters = f.chapters
+    .filter(ch => showRemoved || ch.status !== "removed")
+    .filter(ch => !onlyEdited || ch.edited_at)
+    .filter(ch => !q || ch.title.toLowerCase().includes(q))
+    .sort(compare);
+  document.getElementById("rows").replaceChildren(...chapters.map(row));
+  const empty = document.getElementById("no-rows");
+  empty.hidden = chapters.length > 0;
+  empty.textContent = f.chapters.length ? "No chapters match these filters." : "Chapters appear here after the first sync.";
+  for (const th of document.querySelectorAll("th[data-sort]")) {
+    th.setAttribute("aria-sort", th.dataset.sort === state.sort.key ? (state.sort.dir > 0 ? "ascending" : "descending") : "none");
+  }
+}
+
+function changeText(c) {
+  switch (c.change_type) {
+    case "edited": return c.old_value ? ["edit date ", dateEl(c.old_value), " → ", dateEl(c.new_value) || "none"] : ["edited ", dateEl(c.new_value)];
+    case "retitled": return [`was “${c.old_value}”`];
+    default: return [];
+  }
+}
+
+async function loadChanges() {
+  const changes = await api(`/api/fictions/${fictionId}/changes`);
+  document.getElementById("changes").replaceChildren(...changes.map(c => h("li", {},
+    h("span", { class: "muted small" }, dateEl(c.detected_at)),
+    h("span", { class: `badge ${c.change_type}` }, CHANGE_LABELS[c.change_type] || c.change_type),
+    h("a", { href: c.chapter_url, target: "_blank", rel: "noopener" }, `#${c.position + 1} ${c.chapter_title}`),
+    h("span", { class: "muted small" }, changeText(c)))));
+  document.getElementById("no-changes").hidden = changes.length > 0;
+}
+
+async function load() {
+  clearTimeout(pollTimer);
+  try {
+    state.fiction = await api(`/api/fictions/${fictionId}`);
+  } catch (e) {
+    const err = document.getElementById("load-error");
+    err.textContent = e.status === 404 ? "This fiction isn't in your library." : `Couldn't load: ${e.message}`;
+    err.hidden = false;
+    return;
+  }
+  document.title = `${state.fiction.title} · RR Changelog`;
+  document.getElementById("head").replaceChildren(...header(state.fiction));
+  renderTable();
+  await loadChanges();
+  if (state.fiction.active_run) pollTimer = setTimeout(load, 2000);
+}
+
+async function refresh() {
+  try { await api(`/api/fictions/${fictionId}/refresh`, { method: "POST" }); }
+  catch (e) { if (e.status !== 409) alert(e.message); }
+  load();
+}
+
+for (const th of document.querySelectorAll("th[data-sort]")) {
+  th.querySelector("button").addEventListener("click", () => {
+    const key = th.dataset.sort;
+    state.sort = { key, dir: state.sort.key === key ? -state.sort.dir : (key === "position" || key === "title" ? 1 : -1) };
+    renderTable();
+  });
+}
+for (const id of ["search", "only-edited", "show-removed"]) {
+  document.getElementById(id).addEventListener("input", () => state.fiction && renderTable());
+}
+
+if (fictionId) load();
+else document.getElementById("load-error").hidden = false;
+</script>
+</body>
+</html>
