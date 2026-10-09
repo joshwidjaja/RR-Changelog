@@ -162,15 +162,58 @@ class CloudflareTests(unittest.TestCase):
         self.assertFalse(scraper.is_cloudflare_challenge(normal))
 
 
+class HttpFetcherTests(unittest.TestCase):
+    class FakeResponse:
+        def __init__(self, status_code, text):
+            self.status_code, self.text = status_code, text
+
+    class FakeSession:
+        def __init__(self, response):
+            self.response, self.calls = response, []
+
+        def get(self, url, headers, timeout):
+            self.calls.append(headers)
+            return self.response
+
+    def fetcher(self, status, text, **kwargs):
+        f = scraper.HttpFetcher(**kwargs)
+        f._session = self.FakeSession(self.FakeResponse(status, text))
+        return f
+
+    def test_returns_body_and_keeps_impersonated_user_agent(self):
+        f = self.fetcher(200, "<html>ok</html>")
+        self.assertEqual(f.fetch("u"), "<html>ok</html>")
+        self.assertNotIn("User-Agent", f._session.calls[0])
+
+    def test_explicit_user_agent_and_cookie_are_sent(self):
+        f = self.fetcher(200, "ok", user_agent="UA/1", cookie="cf_clearance=x")
+        f.fetch("u")
+        self.assertEqual(f._session.calls[0], {"User-Agent": "UA/1", "Cookie": "cf_clearance=x"})
+
+    def test_challenge_and_http_errors(self):
+        with self.assertRaises(scraper.CloudflareBlocked):
+            self.fetcher(403, CHALLENGE_PAGE).fetch("u")
+        with self.assertRaises(scraper.FetchError):
+            self.fetcher(404, "<html>not found</html>").fetch("u")
+
+
 class FetcherFallbackTests(unittest.TestCase):
     def setUp(self):
         self.http_calls, self.browser_calls = [], []
-
-        def blocked_fetch(url, user_agent, cookie):
-            self.http_calls.append(url)
-            raise scraper.CloudflareBlocked(url)
-
         test = self
+
+        class BlockedHttp:
+            name = "fake http"
+
+            def __init__(self, user_agent=None, cookie=None):
+                pass
+
+            def fetch(self, url):
+                test.http_calls.append(url)
+                raise scraper.CloudflareBlocked(url)
+
+            def close(self):
+                pass
 
         class FakeBrowser:
             def __init__(self, show, profile_dir):
@@ -183,20 +226,20 @@ class FetcherFallbackTests(unittest.TestCase):
             def close(self):
                 pass
 
-        self._orig = scraper.fetch, scraper.BrowserFetcher
-        scraper.fetch, scraper.BrowserFetcher = blocked_fetch, FakeBrowser
+        self._orig = scraper.HttpFetcher, scraper.BrowserFetcher
+        scraper.HttpFetcher, scraper.BrowserFetcher = BlockedHttp, FakeBrowser
 
     def tearDown(self):
-        scraper.fetch, scraper.BrowserFetcher = self._orig
+        scraper.HttpFetcher, scraper.BrowserFetcher = self._orig
 
     def source(self, fetcher):
-        return scraper.PageSource(fetcher=fetcher, delay=0, user_agent="ua", browser_profile=Path("unused"))
+        return scraper.PageSource(fetcher=fetcher, delay=0, browser_profile=Path("unused"))
 
     def test_auto_switches_to_browser_once_and_stays(self):
         src = self.source("auto")
-        with redirect_stderr(io.StringIO()):
+        with self.assertLogs("rrchangelog.scraper", "WARNING"):
             self.assertEqual(src.get("a", "u1"), "<html>ok</html>")
-            src.get("b", "u2")
+        src.get("b", "u2")
         self.assertEqual(self.http_calls, ["u1"])
         self.assertEqual(self.browser_calls, ["u1", "u2"])
 

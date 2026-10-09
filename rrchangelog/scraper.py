@@ -416,9 +416,21 @@ def parse_chapter_dates(html_text: str) -> ChapterDates:
 
 
 # --------------------------------------------------------------------------- fetching
+#
+# Cloudflare in front of RoyalRoad decides mostly on the client's TLS/HTTP fingerprint.
+# Verified 2026-10-09 on Mother of Learning:
+#   - Python urllib and curl: challenged on every request.
+#   - curl_cffi impersonating Chrome: 109/109 chapters (twice), no challenge, no cookie needed.
+#   - Real (headed) Chromium: passes; kept as a fallback in case the fingerprint check tightens.
+
+try:
+    from curl_cffi import requests as cffi_requests
+except ImportError:  # optional; fall back to urllib
+    cffi_requests = None
 
 
 def fetch(url: str, user_agent: str, cookie: str | None) -> str:
+    """Plain urllib fetch. Used only when curl_cffi isn't installed."""
     headers = {
         "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml",
@@ -455,15 +467,56 @@ def fetch(url: str, user_agent: str, cookie: str | None) -> str:
     return body
 
 
-class BrowserFetcher:
-    """Fetches pages with real Chromium via Playwright, which can pass Cloudflare.
+class HttpFetcher:
+    """HTTP without a browser: curl_cffi impersonating Chrome when installed, else urllib.
 
-    Verified 2026-10-09: Cloudflare lets headless Chromium load ~2 pages, then serves a
-    challenge it never solves; a headed browser isn't challenged at all. So this always
-    runs headed, parking the window off-screen unless show=True (to solve a challenge by hand).
-    Uses a persistent profile so the cf_clearance cookie survives between runs, and
-    returns the raw server HTML rather than the rendered DOM (RoyalRoad's scripts
-    rearrange tooltips once they run).
+    With curl_cffi the User-Agent is left to the impersonation profile unless one is
+    given explicitly, since a UA that doesn't match the TLS fingerprint looks suspicious.
+    """
+
+    def __init__(self, user_agent: str | None = None, cookie: str | None = None):
+        self.user_agent, self.cookie = user_agent, cookie
+        self._session = cffi_requests.Session(impersonate="chrome") if cffi_requests else None
+
+    @property
+    def name(self) -> str:
+        return "curl_cffi (Chrome fingerprint)" if self._session else "urllib"
+
+    def fetch(self, url: str) -> str:
+        if self._session is None:
+            return fetch(url, self.user_agent or DEFAULT_USER_AGENT, self.cookie)
+        headers = {}
+        if self.user_agent:
+            headers["User-Agent"] = self.user_agent
+        if self.cookie:
+            headers["Cookie"] = self.cookie
+        try:
+            response = self._session.get(url, headers=headers, timeout=30)
+        except Exception as e:  # curl_cffi's error classes moved between versions
+            raise FetchError(f"{e} for {url}") from None
+        body = response.text
+        if is_cloudflare_challenge(body):
+            raise CloudflareBlocked(url)
+        if response.status_code >= 400:
+            raise FetchError(f"HTTP {response.status_code} for {url}")
+        return body
+
+    def close(self) -> None:
+        if self._session is not None:
+            self._session.close()
+
+
+class BrowserFetcher:
+    """Fallback: real Chromium via Playwright, for when Cloudflare blocks HttpFetcher too.
+
+    The window is navigated only to get past Cloudflare: once a RoyalRoad page has
+    loaded, every chapter is downloaded with fetch() from inside that page, so the
+    browser's cookies and fingerprint are reused without rendering each chapter.
+    fetch() also returns the raw server HTML, untouched by RoyalRoad's scripts.
+
+    Verified 2026-10-09: headless Chromium gets challenged after ~2 pages, a headed one
+    isn't, so this runs headed with the window parked off-screen unless show=True (to
+    solve a challenge by hand). A persistent profile keeps cf_clearance between runs.
     """
 
     # Only RoyalRoad itself and Cloudflare's challenge need to load. Blocking the rest
@@ -472,6 +525,10 @@ class BrowserFetcher:
     BLOCKED_RESOURCES = {"image", "media", "font"}
     TIMEOUT_MS = 30_000
     SLOW_FETCH_SECONDS = 20
+    IN_PAGE_FETCH = """async (url) => {
+        const response = await fetch(url, { credentials: "include", redirect: "follow" });
+        return [response.status, await response.text()];
+    }"""
 
     def __init__(self, show: bool, profile_dir: Path):
         try:
@@ -494,6 +551,7 @@ class BrowserFetcher:
         self._context.set_default_timeout(self.TIMEOUT_MS)
         self._context.route("**/*", self._route)
         self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
+        self._on_royalroad = False
 
     def _route(self, route) -> None:
         request = route.request
@@ -511,32 +569,43 @@ class BrowserFetcher:
         finally:
             elapsed = time.monotonic() - started
             (log.warning if elapsed > self.SLOW_FETCH_SECONDS else log.debug)("browser fetch took %.1fs: %s", elapsed, url)
-            try:  # stop the page's scripts from running until the next fetch
-                self._page.goto("about:blank")
-            except Exception:
-                pass
 
     def _fetch(self, url: str) -> str:
-        from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeout
+        from playwright.sync_api import Error as PlaywrightError
         try:
-            response = self._page.goto(url, wait_until="domcontentloaded")
-            if response is not None and is_cloudflare_challenge(response.text()):
-                # The interstitial solves itself in a real browser; once it's gone, reload for raw HTML.
-                try:
-                    self._page.wait_for_function("document.title !== 'Just a moment...'",
-                                                 timeout=self.challenge_timeout_ms)
-                except PlaywrightTimeout:
-                    raise CloudflareBlocked(url) from None
-                response = self._page.goto(url, wait_until="domcontentloaded")
-            if response is None:
-                raise FetchError(f"No response for {url}")
-            body = response.text()
+            if not self._on_royalroad:
+                return self._navigate(url)  # first request: load a real page to get past Cloudflare
+            status, body = self._page.evaluate(self.IN_PAGE_FETCH, url)
+            if is_cloudflare_challenge(body):
+                # Clearance expired or Cloudflare escalated: solve it in the window again.
+                return self._navigate(url)
         except PlaywrightError as e:
+            self._on_royalroad = False  # e.g. the page navigated away; reload on the next try
             raise FetchError(f"{e.message.splitlines()[0]} for {url}") from None
+        if status >= 400:
+            raise FetchError(f"HTTP {status} for {url}")
+        return body
+
+    def _navigate(self, url: str) -> str:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeout
+        log.debug("browser navigating to %s", url)
+        response = self._page.goto(url, wait_until="domcontentloaded")
+        if response is not None and is_cloudflare_challenge(response.text()):
+            # The interstitial solves itself in a real browser; once it's gone, reload for raw HTML.
+            try:
+                self._page.wait_for_function("document.title !== 'Just a moment...'",
+                                             timeout=self.challenge_timeout_ms)
+            except PlaywrightTimeout:
+                raise CloudflareBlocked(url) from None
+            response = self._page.goto(url, wait_until="domcontentloaded")
+        if response is None:
+            raise FetchError(f"No response for {url}")
+        body = response.text()
         if is_cloudflare_challenge(body):
             raise CloudflareBlocked(url)
         if response.status >= 400:
             raise FetchError(f"HTTP {response.status} for {url}")
+        self._on_royalroad = True
         return body
 
     def close(self) -> None:
@@ -547,28 +616,30 @@ class BrowserFetcher:
 class PageSource:
     """Fetches pages live (throttled, with retries), or reads them from a directory saved earlier.
 
-    fetcher="auto" uses plain HTTP and switches to Playwright for the rest of this
+    fetcher="auto" uses HttpFetcher and switches to BrowserFetcher for the rest of this
     PageSource's life the first time Cloudflare blocks a request. Playwright objects
     are thread-bound, so use a PageSource from one thread only.
     """
 
-    def __init__(self, *, fetcher: str = "auto", delay: float = 1.0, user_agent: str = DEFAULT_USER_AGENT,
+    def __init__(self, *, fetcher: str = "auto", delay: float = 1.0, user_agent: str | None = None,
                  cookie: str | None = None, show_browser: bool = False,
                  browser_profile: Path = DEFAULT_BROWSER_PROFILE,
                  from_dir: Path | None = None, save_dir: Path | None = None):
         if fetcher not in ("auto", "http", "browser"):
             raise ValueError(f"unknown fetcher: {fetcher}")
-        self.fetcher, self.delay, self.user_agent, self.cookie = fetcher, delay, user_agent, cookie
+        self.fetcher, self.delay = fetcher, delay
         self.show_browser, self.browser_profile = show_browser, Path(browser_profile)
         self.from_dir = Path(from_dir) if from_dir else None
         self.save_dir = Path(save_dir) if save_dir else None
         if self.save_dir:
             self.save_dir.mkdir(parents=True, exist_ok=True)
         self._last_fetch = 0.0
+        self._http = HttpFetcher(user_agent, cookie)
         self._browser: BrowserFetcher | None = None
         self._use_browser = fetcher == "browser"
 
     def close(self) -> None:
+        self._http.close()
         if self._browser:
             self._browser.close()
             self._browser = None
@@ -592,11 +663,11 @@ class PageSource:
     def _fetch_once(self, url: str) -> str:
         if not self._use_browser:
             try:
-                return fetch(url, self.user_agent, self.cookie)
+                return self._http.fetch(url)
             except CloudflareBlocked:
                 if self.fetcher != "auto":
                     raise
-                log.warning("Cloudflare blocked plain HTTP; switching to a browser (Playwright).")
+                log.warning("Cloudflare blocked %s; switching to a browser (Playwright).", self._http.name)
                 self._use_browser = True
         if self._browser is None:
             self._browser = BrowserFetcher(self.show_browser, self.browser_profile)

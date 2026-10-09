@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from rrchangelog.scraper import (  # noqa: E402
-    BASE_URL, DEFAULT_BROWSER_PROFILE, DEFAULT_USER_AGENT, CloudflareBlocked, Fiction, FetchError,
+    BASE_URL, DEFAULT_BROWSER_PROFILE, CloudflareBlocked, Fiction, FetchError,
     PageSource, parse_chapter_dates, parse_fiction, parse_fiction_id,
 )
 
@@ -53,10 +53,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("url", help="fiction URL, chapter URL, or fiction ID")
     p.add_argument("--limit", type=int, help="only check the first N chapters")
     p.add_argument("--delay", type=float, default=1.0, help="seconds between requests (default 1.0)")
-    p.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
+    p.add_argument("--user-agent", help="override the User-Agent (default: curl_cffi's Chrome profile)")
     p.add_argument("--cookie", help='Cookie header, e.g. "cf_clearance=..."')
     p.add_argument("--fetcher", choices=("auto", "http", "browser"), default="auto",
-                   help="auto: plain HTTP, switching to Playwright if Cloudflare blocks it (default)")
+                   help="auto: HTTP (curl_cffi), switching to Playwright if Cloudflare blocks it (default)")
     p.add_argument("--show-browser", action="store_true",
                    help="show the Playwright window (e.g. to solve a Cloudflare challenge by hand)")
     p.add_argument("--browser-profile", metavar="DIR", default=str(DEFAULT_BROWSER_PROFILE),

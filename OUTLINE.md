@@ -15,16 +15,17 @@ Browsers cannot fetch `royalroad.com` directly (CORS), so scraping must run outs
 
 ### Known findings (2026-10-09)
 
-- **Cloudflare is inconsistent.** `curl` (and WebFetch) got a `403` "Just a moment..." challenge, while Python `urllib` from the same machine got through. It likely depends on the client's TLS fingerprint, so it can change without warning.
-- **Cloudflare fallback: Playwright (chosen).** Findings from testing:
-  - Headless Chromium (either build) is challenged immediately while it reports `HeadlessChrome` in its UA.
-  - With a normal UA it loads ~2 pages, then gets a challenge it never solves (resource blocking made no difference).
-  - **Headed Chromium is not challenged at all.** It still works with the window parked off-screen (`--window-position=-32000,-32000`): a full 126-chapter fiction ran with zero challenges (≈2.7 s/chapter).
-  - So the fetcher is: plain HTTP first → on the first challenge, switch to off-screen headed Chromium for the rest of the run, with a persistent profile so `cf_clearance` survives between runs. A "show browser" mode allows solving a challenge by hand.
-  - Deployment implication: headed Chromium needs a display. Fine for a local app; a server needs `xvfb` (or similar).
-  - In the web app (later that day) plain HTTP was blocked on every sync, so the browser path is the normal path, not a rare fallback.
-  - Left alone, RoyalRoad's ad scripts pegged the browser's CPU, and one refresh took 37 min instead of ~5. The fetcher now blocks every request that isn't to `royalroad.com`/`cloudflare.com` (and images/fonts), and parks the tab on `about:blank` between fetches. That gives ≈1.4 s per fetch, ≈2.8 s per chapter with the 1 s throttle (109 chapters in 5m08s).
+- **Cloudflare decides on the client's network fingerprint, not on cookies or JavaScript.** Findings so far:
+  - At first, Python `urllib` got through and `curl` didn't. By the evening, `urllib` was challenged on every request.
+  - **`curl_cffi` impersonating Chrome passes with no challenge and no `cf_clearance` cookie:** 109/109 Mother of Learning chapters, three full runs, ≈0.8 s per request. **This is the default fetcher.** A full refresh takes 3m21s with no browser.
+- **Fallback: Playwright (rarely needed now).** Used automatically only if Cloudflare starts blocking `curl_cffi` too.
+  - Headless Chromium is challenged (immediately with its `HeadlessChrome` UA, or after ~2 pages with a normal one). Headed Chromium isn't, and still works with the window parked off-screen.
+  - The browser **navigates only once** to get past Cloudflare. After that, every chapter is downloaded with `fetch()` from inside that page (≈0.9 s each), so it never renders chapter pages and returns raw server HTML.
+  - It blocks every request that isn't to `royalroad.com`/`cloudflare.com` (plus images/fonts). Before that, RoyalRoad's ad scripts pegged the CPU and one refresh took 37 min.
+  - It uses a persistent profile (`.browser-profile/`) so clearance survives between runs, and a "show browser" mode for solving a challenge by hand.
+  - Deployment implication: headed Chromium needs a display (`xvfb` on a server). With `curl_cffi` as the default this only matters if the fallback kicks in.
   - Detect challenges and surface them; never mistake one for "no chapters" or "never edited".
+- **RSS (`/fiction/syndication/<id>`) can't replace per-chapter checks:** it lists only the 10 newest posts and no edit dates.
 - **Two RoyalRoad layouts are live.** A redesign has been in testing since Sept 2026 alongside the legacy UI. Parsers must handle both.
 - **Fiction page data sources** (per FanFicFare's maintained adapter):
   - `window.chapters = [...]` JSON in a `<script>`: `id, volumeId, title, slug, date (ISO, published), order, visible, subscriptionTiers, isUnlocked, url`. Present in both layouts.
@@ -155,7 +156,7 @@ Settings are environment variables (see `rrchangelog/api.py`):
 | Variable | Meaning |
 |---|---|
 | `RR_DB_PATH` | SQLite file (default `data/rr-changelog.sqlite3`) |
-| `RR_FETCHER` | `auto` (default) / `http` / `browser` |
+| `RR_FETCHER` | `auto` (default: curl_cffi, switching to Playwright if Cloudflare blocks it) / `http` / `browser` |
 | `RR_DELAY` | Seconds between RoyalRoad requests (default `1.0`) |
 | `RR_SHOW_BROWSER=1` | Show the Chromium window, e.g. to solve a Cloudflare challenge |
 | `RR_LOG_LEVEL=DEBUG` | Log every fetch's duration |
@@ -163,7 +164,7 @@ Settings are environment variables (see `rrchangelog/api.py`):
 ### Layout
 
 ```
-rrchangelog/scraper.py   fetch + parse RoyalRoad pages (HTTP → Playwright fallback)
+rrchangelog/scraper.py   fetch + parse RoyalRoad pages (curl_cffi → Playwright fallback)
 rrchangelog/db.py        schema + connection helpers
 rrchangelog/sync.py      one sync run: chapter-list diff, per-chapter date check, change log
 rrchangelog/worker.py    background thread running queued syncs
