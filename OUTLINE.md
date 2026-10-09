@@ -15,23 +15,33 @@ Browsers cannot fetch `royalroad.com` directly (CORS), so scraping must run outs
 
 ### Known findings (2026-10-09)
 
-- **Cloudflare is inconsistent.** `curl` (and WebFetch) got a `403` "Just a moment..." challenge, while Python `urllib` from the same machine got through. It likely depends on the client's TLS fingerprint, so it can change without warning. The PoC detects the challenge page and suggests fallbacks:
-  - reuse a real browser's `cf_clearance` cookie + matching User-Agent,
-  - a headless browser (Playwright) as an escalation path,
-  - running in the user's browser (extension / userscript).
-  This is still the **biggest operational risk**. Detect and surface it, never mistake it for "no chapters".
+- **Cloudflare is inconsistent.** `curl` (and WebFetch) got a `403` "Just a moment..." challenge, while Python `urllib` from the same machine got through. It likely depends on the client's TLS fingerprint, so it can change without warning.
+- **Cloudflare fallback: Playwright (chosen).** Findings from testing:
+  - Headless Chromium (either build) is challenged immediately while it reports `HeadlessChrome` in its UA.
+  - With a normal UA it loads ~2 pages, then gets a challenge it never solves (resource blocking made no difference).
+  - **Headed Chromium is not challenged at all.** It still works with the window parked off-screen (`--window-position=-32000,-32000`): a full 126-chapter fiction ran with zero challenges (≈2.7 s/chapter).
+  - So the fetcher is: plain HTTP first → on the first challenge, switch to off-screen headed Chromium for the rest of the run, with a persistent profile so `cf_clearance` survives between runs. A "show browser" mode allows solving a challenge by hand.
+  - Deployment implication: headed Chromium needs a display. Fine for a local app; a server needs `xvfb` (or similar).
+  - Detect challenges and surface them; never mistake one for "no chapters" or "never edited".
 - **Two RoyalRoad layouts are live.** A redesign has been in testing since Sept 2026 alongside the legacy UI. Parsers must handle both.
 - **Fiction page data sources** (per FanFicFare's maintained adapter):
   - `window.chapters = [...]` JSON in a `<script>`: `id, volumeId, title, slug, date (ISO, published), order, visible, subscriptionTiers, isUnlocked, url`. Present in both layouts.
   - `<script type="application/ld+json">` (redesign): `name, author.name, author.url, description, datePublished, dateModified`.
   - Legacy fallback: `table#chapters tbody tr` rows with a chapter link and `<time unixtime="...">`.
   - Chapters with non-empty `subscriptionTiers` are premium/advance and not publicly readable.
-- **Chapter page dates (verified on the legacy layout):**
+- **Chapter page dates (verified on both layouts):**
   ```html
-  <i class="fa fa-calendar" title="Published"></i> <time unixtime="1540762483" datetime="2018-10-28T21:34:43.0000000Z">…</time>
-  <i class="fa fa-edit" title="Last Edit"></i> <time unixtime="1638566602" datetime="2021-12-03T21:23:22.0000000Z">…</time>
+  <!-- legacy: label is the icon's title, before the <time> -->
+  <i class="fa fa-calendar" title="Published"></i> <time unixtime="1540762483" …>…</time>
+  <i class="fa fa-edit" title="Last Edit"></i> <time unixtime="1638566602" …>…</time>
+  <!-- redesign: no icon title; label is a tooltip *after* the <time> -->
+  <i class="fa fa-calendar mr-1"></i> <time unixtime="1764170027" …>…</time> … <div role="tooltip">Created At</div>
+  <i class="fa fa-edit mr-1"></i> <time unixtime="1785248192" …>…</time> … <div role="tooltip">Edited At</div>
   ```
-  The "Last Edit" entry appears only on edited chapters, so its absence means "never edited" (last updated = published). Prefer the `unixtime` attribute. The redesign's chapter markup is still unverified. The PoC classifies every `<time>` by its label and reports which source it used, so a layout change shows up instead of failing silently.
+  - The **icon** (`fa-calendar` = published, `fa-edit` = edited) is the one signal common to both layouts, so the parser keys on it first, then falls back to nearby labels.
+  - The edit entry appears only on edited chapters, so its absence means "never edited" (last updated = published).
+  - Redesign pages also contain unrelated `<time>`s (e.g. the author's "member for 2 years"); these must stay unlabeled.
+  - Prefer the `unixtime` attribute.
 - **Environment gotcha:** python.org Python on macOS needs `Install Certificates.command` (or `SSL_CERT_FILE=/etc/ssl/cert.pem`) before HTTPS works.
 
 ### Fetching policy
@@ -114,7 +124,7 @@ Plus a job queue/worker (in-process for single-user; BullMQ/Celery to scale). On
 
 ## 10. Milestones
 
-1. **Proof of concept** — `poc/rr_poc.py`: given a fiction URL, print every chapter's last-updated date. Validates selectors, Cloudflare handling and rate limits. *(working on the legacy layout; redesign still to check)*
+1. **Proof of concept** — `poc/rr_poc.py`: given a fiction URL, print every chapter's last-updated date. Validates selectors, Cloudflare handling and rate limits. *(done)*
 2. **MVP** — DB + add/refresh API + background sync + basic library and table UI.
 3. **Polish** — live progress, new/updated highlighting, sorting/filtering, changelog.
 4. **Extras** — scheduled syncs, notifications, multi-user, export.
@@ -123,15 +133,23 @@ Plus a job queue/worker (in-process for single-user; BullMQ/Celery to scale). On
 
 ## Milestone 1: running the PoC
 
-Python 3.10+, standard library only.
+Python 3.10+. The core is standard library only; Playwright is needed only for the Cloudflare fallback.
 
 ```sh
+# One-time setup for the Playwright fallback (project-local venv, gitignored)
+python3 -m venv .venv && .venv/bin/pip install -r poc/requirements.txt && .venv/bin/python -m playwright install chromium
+
 # Try a live fetch (first 5 chapters), saving raw HTML for inspection
 python3 poc/rr_poc.py https://www.royalroad.com/fiction/21220/mother-of-learning --limit 5 --save-html pages/ -v
 
-# If Cloudflare blocks it: open the fiction in your browser, then copy the
-# cf_clearance cookie and your browser's exact User-Agent
-python3 poc/rr_poc.py URL --cookie "cf_clearance=..." --user-agent "Mozilla/5.0 ..."
+# Default --fetcher auto: plain HTTP, switching to off-screen Chromium if Cloudflare blocks it
+.venv/bin/python poc/rr_poc.py URL
+
+# Force the browser, or show its window to click through a challenge by hand
+.venv/bin/python poc/rr_poc.py URL --fetcher browser --show-browser
+
+# Manual alternative: reuse your own browser's cf_clearance cookie + exact User-Agent
+python3 poc/rr_poc.py URL --fetcher http --cookie "cf_clearance=..." --user-agent "Mozilla/5.0 ..."
 
 # Re-parse previously saved pages offline (fiction.html, chapter-<id>.html)
 python3 poc/rr_poc.py URL --from-dir pages/ -v
@@ -140,4 +158,7 @@ python3 poc/rr_poc.py URL --from-dir pages/ -v
 python3 -m unittest discover poc
 ```
 
-**Exit criteria for Milestone 1:** ~~legacy layout returns labelled "Last Edit" dates~~ (done), redesign layout verified, and the Cloudflare fallback strategy for Milestone 2 chosen.
+**Exit criteria for Milestone 1:** all met (2026-10-09):
+- ~~legacy layout returns labelled "Last Edit" dates~~
+- ~~redesign layout verified~~ (from a saved chapter page; the browser run happened to be served legacy)
+- ~~Cloudflare fallback chosen~~ (Playwright, off-screen headed)

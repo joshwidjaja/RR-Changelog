@@ -1,6 +1,6 @@
 """Tests for rr_poc.py.
 
-The HTML below is hand-written. CHAPTER_PAGE mirrors live legacy-layout markup;
+The HTML below is hand-written. CHAPTER_PAGE and REDESIGN_CHAPTER_PAGE mirror live markup;
 the fiction pages mirror structures documented by FanFicFare's RoyalRoad adapter
 (window.chapters JSON, redesign JSON-LD, legacy table#chapters). Full saved pages
 are kept out of the repo since they contain the authors' chapter text.
@@ -52,6 +52,25 @@ CHAPTER_PAGE = """<html><head><title>CH1 Prologue - Test Story | Royal Road</tit
 <div class="chapter-inner chapter-content"><p>It was a dark and stormy night, published in 2021.</p></div>
 </body></html>"""
 
+# Mirrors live redesign chapter markup (fiction 141517, captured 2026-10-09; chapter text omitted).
+# Labels live in tooltips *after* each <time>, and the author card has unrelated <time>s.
+REDESIGN_CHAPTER_PAGE = """<html><head><script>window.royalroad.design = "TailwindRedesign";</script></head><body>
+<div class="chapter-inner chapter-content"><p>It was published long ago, then edited.</p></div>
+<div class="flex justify-end gap-2 flex-wrap"><span class="font-xs font-light text-on-surface-muted leading-7">
+<div data-rr-tooltip class="relative inline-flex justify-center"><div data-rr-tooltip-trigger class="cursor-default"><i class="fa fa-calendar mr-1"></i> <time unixtime="1764170027" title="Wednesday, November 26, 2025 3:13:47&#x202F;PM" datetime="2025-11-26T15:13:47.0000000&#x2B;00:00" format="U" dateonly="true" class="mr-2">Wednesday, November 26, 2025 3:13:47&#x202F;PM</time></div>
+    <div data-rr-tooltip-content role="tooltip">
+                                Created At
+                            </div></div><div data-rr-tooltip class="relative inline-flex justify-center"><div data-rr-tooltip-trigger class="cursor-default"><i class="fa fa-edit mr-1"></i> <time unixtime="1785248192" title="Tuesday, July 28, 2026 2:16:32&#x202F;PM" datetime="2026-07-28T14:16:32.2538450&#x2B;00:00" format="U" dateonly="true" class="">Tuesday, July 28, 2026 2:16:32&#x202F;PM</time></div>
+    <div data-rr-tooltip-content role="tooltip">
+                                    Edited At
+                                </div></div></span>
+<a href="/fiction/syndication/141517"><span><i class="fa-solid fa-rss mr-1"></i>RSS</span></a></div>
+<h3><span>About author \\</span></h3><h4>Some Author</h4>
+<div data-rr-tooltip-trigger class="cursor-pointer"><span><i class="fa-regular fa-clock mr-1"></i><time unixtime="1711097607" title="Friday, March 22, 2024 8:53:27&#x202F;AM" datetime="2024-03-22T08:53:27.0000000&#x2B;00:00" format="agoveryshort" class="">2y </time></span></div>
+<div data-rr-tooltip-content role="tooltip">Some Author has been a member for
+    <time unixtime="1711097607" title="Friday, March 22, 2024 8:53:27&#x202F;AM" datetime="2024-03-22T08:53:27.0000000&#x2B;00:00" format="agoshort" class="">2 years </time></div>
+</body></html>"""
+
 CHALLENGE_PAGE = """<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title></head>
 <body><script>window._cf_chl_opt={cvId:'3'};</script></body></html>"""
 
@@ -96,6 +115,20 @@ class ParseChapterDatesTests(unittest.TestCase):
         self.assertEqual(d.updated.value, datetime(2022, 1, 5, 8, 30, tzinfo=timezone.utc))
         self.assertIn("Last Edit", d.updated.source)
 
+    def test_redesign_icons_and_trailing_tooltips(self):
+        d = rr_poc.parse_chapter_dates(REDESIGN_CHAPTER_PAGE)
+        self.assertEqual(d.published.value, datetime(2025, 11, 26, 15, 13, 47, tzinfo=timezone.utc))
+        self.assertEqual(d.updated.value, datetime(2026, 7, 28, 14, 16, 32, tzinfo=timezone.utc))
+        self.assertIn("Edited At", d.updated.source)
+        self.assertEqual([c.kind for c in d.candidates[2:]], ["unlabeled", "unlabeled"])  # author "member since"
+
+    def test_redesign_unedited_chapter_has_no_updated_date(self):
+        start = REDESIGN_CHAPTER_PAGE.index('<div data-rr-tooltip class="relative inline-flex justify-center"><div data-rr-tooltip-trigger class="cursor-default"><i class="fa fa-edit')
+        end = REDESIGN_CHAPTER_PAGE.index("</span>", start)
+        d = rr_poc.parse_chapter_dates(REDESIGN_CHAPTER_PAGE[:start] + REDESIGN_CHAPTER_PAGE[end:])
+        self.assertIsNotNone(d.published)
+        self.assertIsNone(d.updated)
+
     def test_meta_and_json_ld_candidates(self):
         page = """<html><head><meta property="article:modified_time" content="2023-02-02T00:00:00Z">
         <script type="application/ld+json">{"@type":"Article","datePublished":"2023-01-01T00:00:00Z"}</script>
@@ -122,6 +155,52 @@ class CloudflareTests(unittest.TestCase):
         self.assertTrue(rr_poc.is_cloudflare_challenge(CHALLENGE_PAGE))
         normal = REDESIGN_FICTION.replace("</body>", '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script></body>')
         self.assertFalse(rr_poc.is_cloudflare_challenge(normal))
+
+
+class FetcherFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.http_calls, self.browser_calls = [], []
+
+        def blocked_fetch(url, user_agent, cookie):
+            self.http_calls.append(url)
+            raise rr_poc.CloudflareBlocked(url)
+
+        test = self
+
+        class FakeBrowser:
+            def __init__(self, show, profile_dir):
+                pass
+
+            def fetch(self, url):
+                test.browser_calls.append(url)
+                return "<html>ok</html>"
+
+            def close(self):
+                pass
+
+        self._orig = rr_poc.fetch, rr_poc.BrowserFetcher
+        rr_poc.fetch, rr_poc.BrowserFetcher = blocked_fetch, FakeBrowser
+
+    def tearDown(self):
+        rr_poc.fetch, rr_poc.BrowserFetcher = self._orig
+
+    def source(self, fetcher):
+        args = rr_poc.argparse.Namespace(fetcher=fetcher, from_dir=None, save_html=None, delay=0,
+                                         user_agent="ua", cookie=None, show_browser=False, browser_profile="unused")
+        return rr_poc.PageSource(args)
+
+    def test_auto_switches_to_browser_once_and_stays(self):
+        src = self.source("auto")
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(src.get("a", "u1"), "<html>ok</html>")
+            src.get("b", "u2")
+        self.assertEqual(self.http_calls, ["u1"])
+        self.assertEqual(self.browser_calls, ["u1", "u2"])
+
+    def test_http_mode_never_uses_browser(self):
+        with self.assertRaises(rr_poc.CloudflareBlocked):
+            self.source("http").get("a", "u1")
+        self.assertEqual(self.browser_calls, [])
 
 
 class EndToEndOfflineTests(unittest.TestCase):

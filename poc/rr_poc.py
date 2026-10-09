@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """Proof of concept: print every chapter's last-updated date for a RoyalRoad fiction.
 
-Milestone 1 of OUTLINE.md. Standard library only.
+Milestone 1 of OUTLINE.md. Standard library only; Playwright is an optional
+fallback for when Cloudflare blocks plain HTTP requests.
 
     python3 poc/rr_poc.py https://www.royalroad.com/fiction/21220/mother-of-learning --limit 5 -v
     python3 poc/rr_poc.py URL --save-html pages/        # keep raw HTML for inspection
     python3 poc/rr_poc.py URL --from-dir pages/         # re-parse saved pages offline
+    python3 poc/rr_poc.py URL --fetcher browser         # always use Playwright
     python3 poc/rr_poc.py URL --cookie "cf_clearance=..." --user-agent "<your browser's UA>"
 
-Chapter pages (legacy layout, verified 2026-10-09) show dates as
-    <i class="fa fa-calendar" title="Published"></i> <time unixtime=...>
-    <i class="fa fa-edit" title="Last Edit"></i> <time unixtime=...>
-with the "Last Edit" entry apparently present only on edited chapters. The redesign
-may differ, so the parser classifies every date candidate by its label and reports
-which one it used (the Source column). Use -v to see all candidates.
+Chapter pages show dates next to Font Awesome icons in both layouts (verified 2026-10-09):
+    legacy:   <i class="fa fa-calendar" title="Published"></i> <time unixtime=...>
+              <i class="fa fa-edit" title="Last Edit"></i> <time unixtime=...>
+    redesign: <i class="fa fa-calendar mr-1"></i> <time unixtime=...> ... tooltip "Created At"
+              <i class="fa fa-edit mr-1"></i> <time unixtime=...> ... tooltip "Edited At"
+The edit entry appears only on edited chapters. The parser classifies each <time> by
+its icon first, then by nearby labels, and reports which one it used (the Source
+column). Use -v to see all candidates.
 """
 
 import argparse
@@ -33,7 +37,8 @@ BASE_URL = "https://www.royalroad.com"
 DEFAULT_USER_AGENT = "RR-Changelog-PoC/0.1 (personal chapter-date checker)"
 
 UPDATED_WORDS = ("updat", "edit", "modif", "revis")
-PUBLISHED_WORDS = ("publish", "posted", "released")
+PUBLISHED_WORDS = ("publish", "posted", "released", "created")
+ICON_KINDS = {"fa-edit": "updated", "fa-pen-to-square": "updated", "fa-calendar": "published"}
 
 
 class CloudflareBlocked(Exception):
@@ -130,8 +135,11 @@ def classify(text: str) -> str:
 @dataclass
 class TimeTag:
     attrs: dict[str, str]
-    context: str  # nearby labels: preceding text plus title/aria-label of recent tags
+    icon: str  # kind implied by the closest preceding Font Awesome icon, or ""
+    labels: str  # title/aria-label attributes of tags just before this <time>
+    preceding: str  # visible text just before this <time>
     text: str = ""
+    trailing: str = ""  # visible text right after it (redesign tooltips: "Edited At")
 
 
 class PageScanner(HTMLParser):
@@ -153,7 +161,9 @@ class PageScanner(HTMLParser):
         self._skip_text = 0  # inside <style>
         self._recent_text = ""
         self._recent_labels: list[str] = []
+        self._recent_icon = ""
         self._open_time: TimeTag | None = None
+        self._last_time: TimeTag | None = None
         self._table_depth = 0
         self._chapters_table_depth: int | None = None
         self._row: dict | None = None
@@ -162,8 +172,13 @@ class PageScanner(HTMLParser):
         attrs = {k: (v or "") for k, v in attrs_list}
 
         label = " ".join(attrs[k] for k in ("title", "aria-label", "data-original-title") if attrs.get(k))
-        if label:
+        if label and tag != "time":  # a <time>'s own title is just the formatted date
             self._recent_labels = (self._recent_labels + [label])[-3:]
+
+        if tag == "i":
+            # Only the closest icon counts, so an unrelated icon resets it.
+            classes = attrs.get("class", "").split()
+            self._recent_icon = next((ICON_KINDS[c] for c in classes if c in ICON_KINDS), "")
 
         if tag == "title":
             self._in_title = True
@@ -188,9 +203,14 @@ class PageScanner(HTMLParser):
             if "/chapter/" in href:
                 self._row["href"] = href
         elif tag == "time":
-            context = " ".join(self._recent_labels) + " " + self._recent_text
-            self._open_time = TimeTag(attrs=attrs, context=context.strip())
+            self._open_time = TimeTag(
+                attrs=attrs,
+                icon=self._recent_icon,
+                labels=" | ".join(self._recent_labels),
+                preceding=self._recent_text.strip(),
+            )
             self.times.append(self._open_time)
+            self._last_time = None
             if self._row is not None and self._row["time"] is None:
                 self._row["time"] = attrs
 
@@ -204,9 +224,11 @@ class PageScanner(HTMLParser):
             self._skip_text -= 1
         elif tag == "time":
             # Labels seen so far belonged to this <time>; don't let them leak onto the next one.
+            self._last_time = self._open_time
             self._open_time = None
             self._recent_text = ""
             self._recent_labels = []
+            self._recent_icon = ""
         elif tag == "tr":
             self._row = None
         elif tag == "table":
@@ -222,12 +244,17 @@ class PageScanner(HTMLParser):
             return
         if self._in_title:
             self.title += data
+        text = " ".join(data.split())
+        claimed = False
         if self._open_time is not None:
             self._open_time.text += data
+        elif self._last_time is not None and len(self._last_time.trailing) < self.CONTEXT_CHARS:
+            # Claimed as this <time>'s trailing label, so it doesn't also count as the next one's context.
+            self._last_time.trailing = (self._last_time.trailing + " " + text).strip()
+            claimed = True
         if self._row is not None and self._row["href"] and not self._row["title"]:
             self._row["title"] = data.strip()
-        text = " ".join(data.split())
-        if text:
+        if text and not claimed:
             self._recent_text = (self._recent_text + " " + text)[-self.CONTEXT_CHARS:]
 
 
@@ -267,6 +294,24 @@ def extract_window_chapters(scanner: PageScanner) -> list[dict] | None:
         if isinstance(data, list):
             return data
     return None
+
+
+def classify_time(tag: TimeTag) -> tuple[str, str]:
+    """Most specific evidence first: own label, icon, preceding labels, trailing tooltip, preceding text."""
+    own = " ".join(tag.attrs[k] for k in ("aria-label", "data-original-title", "title") if tag.attrs.get(k))
+    # Name the icon by whichever nearby label agrees with it ("Last Edit", "Edited At").
+    nearest = (tag.labels.rsplit(" | ", 1)[-1], " ".join(tag.trailing.split()[:2]))
+    icon_label = next((t for t in nearest if tag.icon and classify(t) == tag.icon), "")
+    for kind, source in (
+        (classify(own), f'title "{own[:30]}"'),
+        (tag.icon or "unlabeled", f'icon "{icon_label.strip()}"' if icon_label else "icon"),
+        (classify(tag.labels), f'label "{tag.labels[-30:]}"'),
+        (classify(tag.trailing), f'tooltip "{tag.trailing[:30]}"'),
+        (classify(tag.preceding), f'text "{tag.preceding[-30:]}"'),
+    ):
+        if kind != "unlabeled":
+            return kind, source
+    return "unlabeled", f'<time> "{tag.text.strip()[:30]}"'
 
 
 def time_tag_value(tag: TimeTag) -> datetime | None:
@@ -336,12 +381,8 @@ def parse_chapter_dates(html_text: str) -> ChapterDates:
         value = time_tag_value(tag)
         if value is None:
             continue
-        own_label = " ".join(tag.attrs[k] for k in ("title", "aria-label", "data-original-title") if tag.attrs.get(k))
-        kind = classify(own_label)
-        if kind == "unlabeled":
-            kind = classify(tag.context)
-        snippet = (own_label or tag.context)[-40:].strip()
-        candidates.append(DateCandidate(kind, value, f'<time> "{snippet}"'))
+        kind, source = classify_time(tag)
+        candidates.append(DateCandidate(kind, value, source))
 
     # 2. Meta tags
     for key, kind in (("article:modified_time", "updated"), ("og:updated_time", "updated"),
@@ -405,8 +446,75 @@ def fetch(url: str, user_agent: str, cookie: str | None) -> str:
     return body
 
 
+class BrowserFetcher:
+    """Fetches pages with real Chromium via Playwright, which can pass Cloudflare.
+
+    Verified 2026-10-09: Cloudflare lets headless Chromium load ~2 pages, then serves a
+    challenge it never solves; a headed browser isn't challenged at all. So this always
+    runs headed, parking the window off-screen unless show=True (to solve a challenge by hand).
+    Uses a persistent profile so the cf_clearance cookie survives between runs, and
+    returns the raw server HTML rather than the rendered DOM (RoyalRoad's scripts
+    rearrange tooltips once they run).
+    """
+
+    BLOCKED_RESOURCES = {"image", "media", "font"}
+
+    def __init__(self, show: bool, profile_dir: Path):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            raise FetchError("Playwright isn't installed: pip install playwright && "
+                             "python -m playwright install chromium") from None
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        args = ["--disable-blink-features=AutomationControlled"]
+        if not show:
+            args.append("--window-position=-32000,-32000")
+        # Leave a person time to click through a challenge when the window is visible.
+        self.challenge_timeout_ms = 180_000 if show else 30_000
+        self._pw = sync_playwright().start()
+        try:
+            self._context = self._pw.chromium.launch_persistent_context(str(profile_dir), headless=False, args=args)
+        except Exception:
+            self._pw.stop()
+            raise
+        self._context.route("**/*", lambda route: route.abort()
+                            if route.request.resource_type in self.BLOCKED_RESOURCES else route.continue_())
+        self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
+
+    def fetch(self, url: str) -> str:
+        from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeout
+        try:
+            response = self._page.goto(url, wait_until="domcontentloaded")
+            if response is not None and is_cloudflare_challenge(response.text()):
+                # The interstitial solves itself in a real browser; once it's gone, reload for raw HTML.
+                try:
+                    self._page.wait_for_function("document.title !== 'Just a moment...'",
+                                                 timeout=self.challenge_timeout_ms)
+                except PlaywrightTimeout:
+                    raise CloudflareBlocked(url) from None
+                response = self._page.goto(url, wait_until="domcontentloaded")
+            if response is None:
+                raise FetchError(f"No response for {url}")
+            body = response.text()
+        except PlaywrightError as e:
+            raise FetchError(f"{e.message.splitlines()[0]} for {url}") from None
+        if is_cloudflare_challenge(body):
+            raise CloudflareBlocked(url)
+        if response.status >= 400:
+            raise FetchError(f"HTTP {response.status} for {url}")
+        return body
+
+    def close(self) -> None:
+        self._context.close()
+        self._pw.stop()
+
+
 class PageSource:
-    """Fetches pages live (throttled), or reads them from a directory saved earlier."""
+    """Fetches pages live (throttled), or reads them from a directory saved earlier.
+
+    --fetcher auto uses plain HTTP and switches to Playwright for the rest of the run
+    the first time Cloudflare blocks a request.
+    """
 
     def __init__(self, args):
         self.args = args
@@ -415,6 +523,13 @@ class PageSource:
         if self.save_dir:
             self.save_dir.mkdir(parents=True, exist_ok=True)
         self._last_fetch = 0.0
+        self._browser: BrowserFetcher | None = None
+        self._use_browser = args.fetcher == "browser"
+
+    def close(self) -> None:
+        if self._browser:
+            self._browser.close()
+            self._browser = None
 
     def get(self, name: str, url: str) -> str | None:
         if self.from_dir:
@@ -432,10 +547,24 @@ class PageSource:
             (self.save_dir / f"{name}.html").write_text(body, encoding="utf-8")
         return body
 
+    def _fetch_once(self, url: str) -> str:
+        if not self._use_browser:
+            try:
+                return fetch(url, self.args.user_agent, self.args.cookie)
+            except CloudflareBlocked:
+                if self.args.fetcher != "auto":
+                    raise
+                print("\nCloudflare blocked plain HTTP; switching to a browser (Playwright).",
+                      file=sys.stderr, flush=True)
+                self._use_browser = True
+        if self._browser is None:
+            self._browser = BrowserFetcher(self.args.show_browser, Path(self.args.browser_profile))
+        return self._browser.fetch(url)
+
     def _fetch_with_retry(self, url: str, attempts: int = 3) -> str:
         for attempt in range(1, attempts + 1):
             try:
-                return fetch(url, self.args.user_agent, self.args.cookie)
+                return self._fetch_once(url)
             except FetchError:
                 if attempt == attempts:
                     raise
@@ -454,11 +583,13 @@ CLOUDFLARE_HELP = """\
 RoyalRoad returned a Cloudflare challenge page instead of content.
 
 Options:
-  1. Open the fiction in your normal browser, then copy:
+  1. Use the Playwright fallback (needs: pip install playwright && python -m playwright install chromium).
+     If the browser is still challenged, add --show-browser and complete the challenge in the window.
+  2. Open the fiction in your normal browser, then copy:
        - the cf_clearance cookie (DevTools → Application → Cookies → royalroad.com)
        - your browser's exact User-Agent (DevTools console: navigator.userAgent)
-     and rerun with:  --cookie "cf_clearance=..." --user-agent "..."
-  2. Save the pages from your browser (Save Page As → HTML only) as
+     and rerun with:  --fetcher http --cookie "cf_clearance=..." --user-agent "..."
+  3. Save the pages from your browser (Save Page As → HTML only) as
      fiction.html and chapter-<id>.html in a folder, then rerun with --from-dir.
 """
 
@@ -470,6 +601,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--delay", type=float, default=1.0, help="seconds between requests (default 1.0)")
     p.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
     p.add_argument("--cookie", help='Cookie header, e.g. "cf_clearance=..."')
+    p.add_argument("--fetcher", choices=("auto", "http", "browser"), default="auto",
+                   help="auto: plain HTTP, switching to Playwright if Cloudflare blocks it (default)")
+    p.add_argument("--show-browser", action="store_true",
+                   help="show the Playwright window (e.g. to solve a Cloudflare challenge by hand)")
+    p.add_argument("--browser-profile", metavar="DIR", default=str(Path(__file__).parent / ".browser-profile"),
+                   help="Playwright profile dir; keeps Cloudflare clearance between runs")
     p.add_argument("--save-html", metavar="DIR", help="save fetched pages to DIR")
     p.add_argument("--from-dir", metavar="DIR", help="read pages from DIR instead of the network")
     p.add_argument("--json", action="store_true", help="output JSON instead of a table")
@@ -483,6 +620,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     source = PageSource(args)
+    try:
+        return run(args, fiction_id, source)
+    finally:
+        source.close()
+
+
+def run(args, fiction_id: int, source: PageSource) -> int:
     try:
         fiction_html = source.get("fiction", f"{BASE_URL}/fiction/{fiction_id}")
         if fiction_html is None:
@@ -513,6 +657,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 body = source.get(f"chapter-{chapter.id}", chapter.url)
             except CloudflareBlocked:
+                row["note"] = "blocked by Cloudflare"
                 print(CLOUDFLARE_HELP, file=sys.stderr)
                 break
             except FetchError as e:
@@ -571,7 +716,7 @@ def print_table(results: list[dict], verbose: bool) -> None:
                 print(f"{'':>6}· {c.kind:<9} {fmt(c.value)}  {c.source}")
 
     print(f"\n{found}/{len(results)} chapters had an 'updated' date; {edited} differ from publish date.")
-    if found < len(results):
+    if any(r["dates"] and not r["dates"].updated for r in results):
         print("Chapters without one are most likely unedited (RoyalRoad omits 'Last Edit' then).")
     if results and not found:
         print("No 'updated' dates were recognised. Rerun with --save-html DIR -v and inspect the\n"
